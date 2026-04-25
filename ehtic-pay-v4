@@ -1,1 +1,616 @@
+## 🎯 **แผนปฏิบัติการปรับแต่ง GCCC สู่ระดับ Production-Ready RC**
 
+### **1. Technical Fine-Tuning**
+
+#### ✅ **Database Pooling (รองรับ 24 Nodes พร้อมกัน)**
+```php
+// core/database-pool.php
+<?php
+class DatabasePool {
+    private static $instance = null;
+    private $connections = [];
+    private $maxConnections = 10;
+    private $currentConnections = 0;
+    
+    public static function getInstance() {
+        if (!self::$instance) {
+            self::$instance = new self();
+        }
+        return self::$instance;
+    }
+    
+    public function getConnection() {
+        // ลองใช้ Connection ที่ว่างก่อน
+        foreach ($this->connections as $key => $conn) {
+            if ($conn['in_use'] === false) {
+                $this->connections[$key]['in_use'] = true;
+                return $conn['pdo'];
+            }
+        }
+        
+        // สร้าง Connection ใหม่ถ้ายังไม่เกิน Limit
+        if ($this->currentConnections < $this->maxConnections) {
+            return $this->createNewConnection();
+        }
+        
+        // รอ Connection ว่าง (Queue System)
+        return $this->waitForConnection();
+    }
+    
+    private function createNewConnection() {
+        $pdo = new PDO(
+            'mysql:host=' . getenv('DB_HOST') . ';dbname=' . getenv('DB_NAME') . ';charset=utf8mb4',
+            getenv('DB_USER'),
+            getenv('DB_PASS'),
+            [
+                PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION,
+                PDO::ATTR_DEFAULT_FETCH_MODE => PDO::FETCH_ASSOC,
+                PDO::ATTR_EMULATE_PREPARES => false,
+                PDO::MYSQL_ATTR_USE_BUFFERED_QUERY => true,
+                PDO::ATTR_TIMEOUT => 5
+            ]
+        );
+        
+        $this->connections[] = [
+            'pdo' => $pdo,
+            'in_use' => true,
+            'created_at' => time()
+        ];
+        
+        $this->currentConnections++;
+        return $pdo;
+    }
+    
+    public function releaseConnection($pdo) {
+        foreach ($this->connections as $key => $conn) {
+            if ($conn['pdo'] === $pdo) {
+                $this->connections[$key]['in_use'] = false;
+                return true;
+            }
+        }
+        return false;
+    }
+}
+```
+
+#### ✅ **Environment Secret Management (.env)**
+```bash
+# .env (ห้าม commit ขึ้น Git!)
+DB_HOST=ethic-db.aws.com
+DB_NAME=gccc_production
+DB_USER=gccc_admin
+DB_PASS=your-super-secure-password-2024!
+
+# API Keys
+TELEGRAM_BOT_TOKEN=123456:ABC-DEF1234ghIkl-zyx57W2v1u123ew11
+LINE_CHANNEL_TOKEN=your-line-channel-token
+SENDGRID_API_KEY=SG.your-sendgrid-api-key
+
+# Security
+ENCRYPTION_KEY=your-256-bit-encryption-key
+JWT_SECRET=your-jwt-secret-key
+SESSION_KEY=your-session-key
+```
+
+```php
+// config/env-loader.php
+<?php
+class EnvLoader {
+    public static function load($path = '.env') {
+        if (!file_exists($path)) {
+            throw new Exception('.env file not found');
+        }
+        
+        $lines = file($path, FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES);
+        
+        foreach ($lines as $line) {
+            if (strpos(trim($line), '#') === 0) {
+                continue; // ข้าม Comment
+            }
+            
+            list($key, $value) = explode('=', $line, 2);
+            $key = trim($key);
+            $value = trim($value);
+            
+            putenv("$key=$value");
+            $_ENV[$key] = $value;
+        }
+    }
+}
+
+// โหลด Environment Variables
+EnvLoader::load(__DIR__ . '/../.env');
+```
+
+#### ✅ **Hardened Security Headers**
+```nginx
+# nginx/security-headers.conf
+# ป้องกัน XSS, Clickjacking, MIME sniffing
+add_header X-Content-Type-Options "nosniff" always;
+add_header X-Frame-Options "DENY" always;
+add_header X-XSS-Protection "1; mode=block" always;
+
+# Content Security Policy (CSP) - จำกัดแหล่งที่มาของ Script
+add_header Content-Security-Policy "
+    default-src 'self';
+    script-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net;
+    style-src 'self' 'unsafe-inline' https://fonts.googleapis.com;
+    font-src 'self' https://fonts.gstatic.com;
+    img-src 'self' data: https:;
+    connect-src 'self' wss: https://api.telegram.org;
+    frame-ancestors 'none';
+" always;
+
+# HTTPS & HSTS
+add_header Strict-Transport-Security "max-age=31536000; includeSubDomains; preload" always;
+
+# ป้องกัน Referrer Leak
+add_header Referrer-Policy "strict-origin-when-cross-origin" always;
+
+# Permissions Policy
+add_header Permissions-Policy "camera=(), microphone=(), geolocation=()" always;
+```
+
+---
+
+### **2. Intensive Logging System**
+
+#### ✅ **Transaction Logs (ทุกการเคลื่อนไหวของ Dust Vault)**
+```php
+// logs/transaction-logger.php
+<?php
+class TransactionLogger {
+    private $db;
+    
+    public function __construct() {
+        $this->db = DatabasePool::getInstance()->getConnection();
+    }
+    
+    public function logDustVaultMovement($userId, $stationId, $amount, $type) {
+        $stmt = $this->db->prepare("
+            INSERT INTO dust_vault_logs 
+            (user_id, station_id, amount, transaction_type, ip_address, user_agent, session_id, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, NOW())
+        ");
+        
+        $stmt->execute([
+            $userId,
+            $stationId,
+            $amount,
+            $type, // 'deposit', 'withdraw', 'transfer'
+            $_SERVER['REMOTE_ADDR'] ?? 'unknown',
+            $_SERVER['HTTP_USER_AGENT'] ?? 'unknown',
+            session_id()
+        ]);
+        
+        // ถ้าเป็นยอดใหญ่ (> 100,000 GDC) ส่ง Alert ทันที
+        if (abs($amount) > 100000) {
+            $this->sendLargeTransactionAlert($userId, $amount, $type);
+        }
+    }
+    
+    public function logLoginAttempt($username, $status, $reason = null) {
+        $stmt = $this->db->prepare("
+            INSERT INTO login_attempts 
+            (username, status, ip_address, user_agent, reason, attempted_at)
+            VALUES (?, ?, ?, ?, ?, NOW())
+        ");
+        
+        $stmt->execute([
+            $username,
+            $status, // 'success', 'failed'
+            $_SERVER['REMOTE_ADDR'] ?? 'unknown',
+            $_SERVER['HTTP_USER_AGENT'] ?? 'unknown',
+            $reason
+        ]);
+        
+        // ถ้าลองผิดเกิน 5 ครั้ง ส่ง Email Alert
+        $failedAttempts = $this->countFailedAttempts($username);
+        if ($failedAttempts >= 5) {
+            $this->sendBruteForceAlert($username, $failedAttempts);
+        }
+    }
+    
+    private function countFailedAttempts($username) {
+        $stmt = $this->db->prepare("
+            SELECT COUNT(*) FROM login_attempts 
+            WHERE username = ? AND status = 'failed' 
+            AND attempted_at > DATE_SUB(NOW(), INTERVAL 15 MINUTE)
+        ");
+        $stmt->execute([$username]);
+        return $stmt->fetchColumn();
+    }
+    
+    private function sendLargeTransactionAlert($userId, $amount, $type) {
+        $alert = new AlertSystem();
+        $alert->sendAlert(
+            "💰 Large Transaction Alert!\n" .
+            "User: {$userId}\n" .
+            "Amount: " . number_format($amount) . " GDC\n" .
+            "Type: {$type}\n" .
+            "IP: {$_SERVER['REMOTE_ADDR']}\n" .
+            "Time: " . date('Y-m-d H:i:s'),
+            'warning'
+        );
+    }
+    
+    private function sendBruteForceAlert($username, $attempts) {
+        $alert = new AlertSystem();
+        $alert->sendAlert(
+            "🔴 Brute Force Alert!\n" .
+            "Username: {$username}\n" .
+            "Failed Attempts: {$attempts}\n" .
+            "IP: {$_SERVER['REMOTE_ADDR']}\n" .
+            "Time: " . date('Y-m-d H:i:s'),
+            'critical'
+        );
+        
+        // ส่ง Email ไปยัง Admin
+        $to = 'EthiHoldings.T@gmail.com';
+        $subject = "🔴 URGENT: Brute Force Attack Detected!";
+        $message = "Failed login attempts exceeded threshold for username: {$username}";
+        mail($to, $subject, $message);
+    }
+}
+```
+
+#### ✅ **Error Logs (ไม่แสดง Error บนหน้าจอ)**
+```php
+// core/error-handler-pro.php
+<?php
+class ProErrorHandler {
+    private $logFile;
+    
+    public function __construct() {
+        $this->logFile = __DIR__ . '/../logs/system_error_' . date('Y-m-d') . '.log';
+    }
+    
+    public function handleError($errno, $errstr, $errfile, $errline) {
+        $errorData = [
+            'timestamp' => date('Y-m-d H:i:s'),
+            'type' => $this->getErrorType($errno),
+            'message' => $errstr,
+            'file' => $errfile,
+            'line' => $errline,
+            'trace' => debug_backtrace(DEBUG_BACKTRACE_IGNORE_ARGS, 5)
+        ];
+        
+        // เขียนลง Log File (ไม่แสดงบนหน้าจอ)
+        $this->writeToLog($errorData);
+        
+        // ถ้าเป็น Critical Error ส่ง Alert
+        if ($errno === E_ERROR || $errno === E_USER_ERROR) {
+            $this->sendCriticalAlert($errorData);
+        }
+        
+        // แสดง Generic Error Message ให้ผู้ใช้ (ไม่ใช่รายละเอียด)
+        if ($errno === E_ERROR || $errno === E_USER_ERROR) {
+            http_response_code(500);
+            include __DIR__ . '/../templates/500.php';
+            exit;
+        }
+        
+        return true; // ป้องกัน PHP แสดง Error ตามปกติ
+    }
+    
+    private function writeToLog($data) {
+        $logMessage = sprintf(
+            "[%s] %s: %s in %s:%d\n%s\n\n",
+            $data['timestamp'],
+            $data['type'],
+            $data['message'],
+            $data['file'],
+            $data['line'],
+            json_encode($data['trace'], JSON_PRETTY_PRINT)
+        );
+        
+        file_put_contents($this->logFile, $logMessage, FILE_APPEND | LOCK_EX);
+    }
+    
+    private function sendCriticalAlert($data) {
+        $alert = new AlertSystem();
+        $alert->sendAlert(
+            "🚨 CRITICAL SYSTEM ERROR!\n" .
+            "Type: {$data['type']}\n" .
+            "Message: {$data['message']}\n" .
+            "File: {$data['file']}:{$data['line']}\n" .
+            "Time: {$data['timestamp']}",
+            'critical'
+        );
+    }
+    
+    private function getErrorType($errno) {
+        $types = [
+            E_ERROR => 'Fatal Error',
+            E_WARNING => 'Warning',
+            E_PARSE => 'Parse Error',
+            E_NOTICE => 'Notice',
+            E_CORE_ERROR => 'Core Error',
+            E_CORE_WARNING => 'Core Warning',
+            E_COMPILE_ERROR => 'Compile Error',
+            E_COMPILE_WARNING => 'Compile Warning',
+            E_USER_ERROR => 'User Error',
+            E_USER_WARNING => 'User Warning',
+            E_USER_NOTICE => 'User Notice',
+            E_STRICT => 'Strict',
+            E_RECOVERABLE_ERROR => 'Recoverable Error',
+            E_DEPRECATED => 'Deprecated',
+            E_USER_DEPRECATED => 'User Deprecated'
+        ];
+        
+        return $types[$errno] ?? 'Unknown Error';
+    }
+}
+
+// ลงทะเบียน Error Handler แบบสมบูรณ์
+$handler = new ProErrorHandler();
+set_error_handler([$handler, 'handleError']);
+set_exception_handler(function($exception) use ($handler) {
+    $handler->handleError(E_ERROR, $exception->getMessage(), $exception->getFile(), $exception->getLine());
+});
+```
+
+---
+
+### **3. High-End Dashboard (Dark-Gold Theme)**
+
+#### ✅ **Interactive Matrix + Dark-Gold Theme**
+```html
+<!-- dashboard-rc.html -->
+<!DOCTYPE html>
+<html lang="th">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>🌐 GCCC - Command Center vRC</title>
+    <link href="https://fonts.googleapis.com/css2?family=Orbitron:wght@400;700;900&display=swap" rel="stylesheet">
+    <style>
+        /* ⚫ Dark-Gold Theme */
+        :root {
+            --bg-primary: #050505;
+            --bg-secondary: #0a0a0a;
+            --gold: #D4AF37;
+            --gold-light: #F0D060;
+            --gold-dark: #B8960F;
+            --green: #00FF88;
+            --red: #FF0044;
+            --text-primary: #FFFFFF;
+            --text-secondary: #888888;
+        }
+        
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        
+        body {
+            background: var(--bg-primary);
+            color: var(--text-primary);
+            font-family: 'Segoe UI', system-ui, -apple-system, sans-serif;
+            min-height: 100vh;
+            overflow-x: hidden;
+        }
+        
+        /* Header สีทอง */
+        .gold-header {
+            background: linear-gradient(180deg, rgba(212,175,55,0.1) 0%, transparent 100%);
+            border-bottom: 1px solid rgba(212,175,55,0.3);
+            padding: 20px 40px;
+            position: sticky;
+            top: 0;
+            z-index: 1000;
+            backdrop-filter: blur(20px);
+        }
+        
+        .gold-header h1 {
+            font-family: 'Orbitron', monospace;
+            font-size: 32px;
+            font-weight: 900;
+            background: linear-gradient(135deg, var(--gold), var(--gold-light), var(--gold));
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            text-shadow: 0 0 30px rgba(212,175,55,0.3);
+        }
+        
+        /* Station Grid */
+        .station-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(300px, 1fr));
+            gap: 25px;
+            padding: 40px;
+        }
+        
+        .station-card {
+            background: linear-gradient(145deg, rgba(212,175,55,0.05), rgba(10,10,10,0.9));
+            border: 1px solid rgba(212,175,55,0.2);
+            border-radius: 16px;
+            padding: 25px;
+            position: relative;
+            overflow: hidden;
+            transition: all 0.4s cubic-bezier(0.4, 0, 0.2, 1);
+            cursor: pointer;
+        }
+        
+        .station-card:hover {
+            transform: translateY(-8px) scale(1.02);
+            border-color: var(--gold);
+            box-shadow: 
+                0 20px 60px rgba(212,175,55,0.2),
+                inset 0 1px 0 rgba(212,175,55,0.3);
+        }
+        
+        /* Gold Border Animation on Hover */
+        .station-card::before {
+            content: '';
+            position: absolute;
+            top: -2px;
+            left: -2px;
+            right: -2px;
+            bottom: -2px;
+            background: linear-gradient(45deg, var(--gold), transparent, var(--gold), transparent);
+            border-radius: 18px;
+            z-index: -1;
+            opacity: 0;
+            transition: opacity 0.4s ease;
+        }
+        
+        .station-card:hover::before {
+            opacity: 1;
+            animation: goldBorder 3s linear infinite;
+        }
+        
+        @keyframes goldBorder {
+            0% { background-position: 0% 50%; }
+            50% { background-position: 100% 50%; }
+            100% { background-position: 0% 50%; }
+        }
+        
+        /* Status Indicator Pulse */
+        .status-indicator {
+            width: 12px;
+            height: 12px;
+            border-radius: 50%;
+            display: inline-block;
+            margin-right: 8px;
+            animation: pulse 2s ease-in-out infinite;
+        }
+        
+        .status-online {
+            background: var(--green);
+            box-shadow: 0 0 15px var(--green);
+        }
+        
+        .status-offline {
+            background: var(--red);
+            box-shadow: 0 0 15px var(--red);
+        }
+        
+        @keyframes pulse {
+            0%, 100% { opacity: 1; transform: scale(1); }
+            50% { opacity: 0.7; transform: scale(1.2); }
+        }
+        
+        /* Digital Clock */
+        .digital-clock {
+            font-family: 'Orbitron', monospace;
+            font-size: 48px;
+            font-weight: 700;
+            color: var(--gold);
+            text-shadow: 0 0 20px rgba(212,175,55,0.5);
+            text-align: center;
+            padding: 30px;
+        }
+        
+        /* Snapshot PDF Button */
+        .snapshot-btn {
+            background: linear-gradient(135deg, var(--gold), var(--gold-dark));
+            border: none;
+            padding: 15px 40px;
+            border-radius: 50px;
+            font-family: 'Orbitron', monospace;
+            font-size: 16px;
+            font-weight: 700;
+            color: var(--bg-primary);
+            cursor: pointer;
+            transition: all 0.3s ease;
+            box-shadow: 0 5px 20px rgba(212,175,55,0.3);
+        }
+        
+        .snapshot-btn:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 10px 40px rgba(212,175,55,0.5);
+        }
+        
+        /* Tooltip สำหรับ Hover */
+        .station-tooltip {
+            position: absolute;
+            top: 50%;
+            left: 50%;
+            transform: translate(-50%, -50%);
+            background: rgba(0,0,0,0.95);
+            border: 1px solid var(--gold);
+            border-radius: 12px;
+            padding: 20px;
+            opacity: 0;
+            transition: opacity 0.3s ease;
+            pointer-events: none;
+            z-index: 10;
+            width: 90%;
+        }
+        
+        .station-card:hover .station-tooltip {
+            opacity: 1;
+        }
+        
+        .tooltip-item {
+            display: flex;
+            justify-content: space-between;
+            padding: 5px 0;
+            border-bottom: 1px solid rgba(212,175,55,0.1);
+        }
+        
+        .tooltip-label {
+            color: var(--text-secondary);
+            font-size: 12px;
+        }
+        
+        .tooltip-value {
+            color: var(--gold);
+            font-family: 'Orbitron', monospace;
+            font-size: 14px;
+        }
+    </style>
+</head>
+<body>
+    <!-- Gold Header -->
+    <div class="gold-header">
+        <div style="display: flex; justify-content: space-between; align-items: center;">
+            <div>
+                <img src="assets/images/ehtc-logo-gold.svg" alt="ETHIC" height="40">
+                <span style="color: var(--gold); margin-left: 15px; font-family: 'Orbitron', monospace; font-size: 14px;">vRC.1.0</span>
+            </div>
+            <div style="display: flex; align-items: center; gap: 30px;">
+                <button class="snapshot-btn" onclick="generatePDF()">
+                    📄 Snapshot Report
+                </button>
+                <div style="text-align: right;">
+                    <div style="font-family: 'Orbitron', monospace; color: var(--gold);" id="clock-display">00:00:00</div>
+                    <div style="color: var(--text-secondary); font-size: 12px;">GMT+7</div>
+                </div>
+            </div>
+        </div>
+    </div>
+    
+    <!-- Station Grid -->
+    <div class="station-grid" id="stationGrid">
+        <!-- สถานีจะถูกสร้างโดย JavaScript -->
+    </div>
+    
+    <!-- Connection Status -->
+    <div style="position: fixed; bottom: 20px; right: 20px; display: flex; align-items: center; gap: 10px; background: rgba(0,0,0,0.9); border: 1px solid rgba(212,175,55,0.3); padding: 15px 25px; border-radius: 30px;">
+        <span class="status-indicator status-online" id="connectionDot"></span>
+        <span style="color: var(--text-secondary); font-size: 14px;">System Connected</span>
+        <span style="color: var(--text-secondary);">|</span>
+        <span id="lastUpdate" style="font-family: 'Orbitron', monospace; color: var(--gold); font-size: 12px;">--:--:--</span>
+    </div>
+    
+    <script>
+        // ข้อมูลสถานี 24 โหนด
+        const stations = [
+            { id: 'N01', name: 'Digital Financial Hub', status: 'online', temp: '42°C', uptime: '99.99%', queue: 0 },
+            { id: 'N02', name: 'Agricultural Commodity Center', status: 'online', temp: '45°C', uptime: '99.97%', queue: 2 },
+            // ... ครบ 24 สถานี
+            { id: 'N24', name: 'Command Center', status: 'online', temp: '48°C', uptime: '99.99%', queue: 0 }
+        ];
+        
+        // สร้าง Station Cards
+        function renderStations() {
+            const grid = document.getElementById('stationGrid');
+            grid.innerHTML = '';
+            
+            stations.forEach(station => {
+                const card = document.createElement('div');
+                card.className = 'station-card';
+                card.innerHTML = `
+                    <div style="display: flex; justify-content: space-between; align-it
